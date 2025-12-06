@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 from OGYEI_dataset import OGYEIDataset, get_transforms
 
 
-class OGYEI_EfficientNetClassifier(nn.Module):
+class OGYEI_Classifier(nn.Module):
     """
     Модель на базе EfficientNet для классификации таблеток
     """
@@ -24,7 +24,7 @@ class OGYEI_EfficientNetClassifier(nn.Module):
         model_name: str = "efficientnet_b3",
         pretrained: bool = True,
         dropout_rate: float = 0.3,
-        freeze_backbone: bool = False
+        unfreeze_layers: int = 0
     ):
         """
         Args:
@@ -32,7 +32,8 @@ class OGYEI_EfficientNetClassifier(nn.Module):
             model_name: Название EfficientNet модели
             pretrained: Использовать предобученные веса ImageNet
             dropout_rate: Dropout в классификаторе
-            freeze_backbone: Заморозить backbone при инициализации
+            unfreeze_layers: int - количество слоев в фичах, которые размораживаем,
+                0 - полная заморозка всех слоев фичей
         """
         super().__init__()
         
@@ -55,24 +56,80 @@ class OGYEI_EfficientNetClassifier(nn.Module):
             nn.Linear(512, num_classes)
         )
         
-        # Замораживаем backbone если нужно
-        if freeze_backbone:
-            self._freeze_backbone()
+        # Замораживаем/размораживаем слои
+        self._setup_layers(unfreeze_layers)
         
         print(f"Модель создана: {model_name}")
         print(f"Количество классов: {num_classes}")
         print(f"Размерность features: {self.feature_dim}")
-        print(f"Backbone заморожен: {freeze_backbone}")
+        print(f"Количество размороженных слоев: {unfreeze_layers}")
     
-    def _freeze_backbone(self):
-        """Замораживает все слои backbone"""
+    def _setup_layers(self, unfreeze_layers: int):
+        """
+        Настройка заморозки/разморозки слоев
+        
+        Args:
+            unfreeze_layers: сколько слоев разморозить с конца
+                - 0: только классификатор обучается
+                - 1+: N последних слоев backbone + классификатор
+        """
+        # Сначала замораживаем ВСЕ слои backbone
         for param in self.model.parameters():
             param.requires_grad = False
-    
-    def unfreeze_backbone(self):
-        """Размораживает все слои backbone"""
-        for param in self.model.parameters():
+        
+        # Если нужно разморозить слои
+        if unfreeze_layers > 0:
+            self._unfreeze_last_n_layers(unfreeze_layers)
+        
+        # Классификатор всегда разморожен
+        for param in self.classifier.parameters():
             param.requires_grad = True
+        
+        # Статистика
+        self._print_stats()
+    
+    def _unfreeze_last_n_layers(self, n: int):
+        """
+        Размораживает N последних слоев модели
+        """
+        # Получаем все дочерние модули модели
+        children = list(self.model.features.children())
+        
+        # Если модель имеет блоки (как EfficientNet)
+        if hasattr(self.model, 'blocks'):
+            blocks = list(self.model.blocks.children())
+            total_blocks = len(blocks)
+            
+            # Размораживаем последние N блоков
+            start_idx = max(0, total_blocks - n)
+            
+            print(f"Размораживание {n} блоков с конца:")
+            print(f"  Всего блоков: {total_blocks}")
+            print(f"  Разморожены блоки: {start_idx}-{total_blocks-1}")
+            
+            for i in range(start_idx, total_blocks):
+                for param in blocks[i].parameters():
+                    param.requires_grad = True
+        
+        # Если нет блоков, размораживаем последние N children
+        else:
+            total_children = len(children)
+            start_idx = max(0, total_children - n)
+            
+            print(f"Размораживание {n} слоев с конца:")
+            print(f"  Всего слоев: {total_children}")
+            print(f"  Разморожены слои: {start_idx}-{total_children-1}")
+            
+            for i in range(start_idx, total_children):
+                for param in children[i].parameters():
+                    param.requires_grad = True
+    
+    def _print_stats(self):
+        """Печатает статистику параметров"""
+        total = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        
+        print(f"Параметры: {trainable:,} обучаемых из {total:,} ({trainable/total:.1%})")
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -123,7 +180,6 @@ def train_model(
     model: nn.Module,
     train_loader: DataLoader,
     val_loader: DataLoader,
-    num_classes: int=100,
     num_epochs: int = 30,
     learning_rate: float = 1e-3,
     weight_decay: float = 1e-4,
@@ -135,7 +191,7 @@ def train_model(
     Простая функция обучения модели
     
     Args:
-        model: Модель для обучения
+        model: OGYEI_Classifier Модель для обучения
         train_loader: DataLoader для тренировочных данных
         val_loader: DataLoader для валидационных данных
         num_classes: Количество классов
@@ -421,15 +477,12 @@ def plot_training_history(history: Dict, save_path: str = None):
     plt.show()
 
 
-def create_model_and_train(
+def train_and_validate_model(
+    model: OGYEI_Classifier,
     checkpoint_path: str,
     train_loader: DataLoader,
     val_loader: DataLoader,
     test_loader: DataLoader = None,
-    num_classes: int = 100,
-    model_name: str = "efficientnet_b3",
-    pretrained: bool = True,
-    freeze_backbone: bool = True,
     num_epochs: int = 30,
     learning_rate: float = 1e-3,
     device: str = None,
@@ -438,15 +491,12 @@ def create_model_and_train(
     Полный пайплайн: создание модели и обучение
     
     Args:
+        model: OGYEI_Classifier модель,
+        checkpoint_path: str путь сохранения модели,
         train_loader: DataLoader для тренировки
         val_loader: DataLoader для валидации
         test_loader: DataLoader для тестирования (опционально)
-        num_classes: Количество классов
-        model_name: Название EfficientNet модели
-        pretrained: Использовать предобученные веса
-        freeze_backbone: Начинать с замороженного backbone
         num_epochs: Количество эпох обучения
-        batch_size: Размер батча
         learning_rate: Learning rate
         device: Устройство для обучения
         
@@ -455,40 +505,11 @@ def create_model_and_train(
         history: История обучения
     """
     
-    # Определяем устройство
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    print(f"Используемое устройство: {device}")
-    if device == "cuda":
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"Память GPU: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-    
-    # Создаем модель
-    print("\n" + "="*60)
-    print("Создание модели...")
-    model = OGYEI_EfficientNetClassifier(
-        num_classes=num_classes,
-        model_name=model_name,
-        pretrained=pretrained,
-        freeze_backbone=freeze_backbone
-    )
-    
-    # Считаем параметры
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Всего параметров: {total_params:,}")
-    print(f"Обучаемых параметров: {trainable_params:,} ({trainable_params/total_params:.1%})")
-    
-    # Обучаем модель
-    print("\n" + "="*60)
-    print("Начало обучения...")
     
     history, trained_model = train_model(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
-        num_classes=num_classes,
         num_epochs=num_epochs,
         learning_rate=learning_rate,
         device=device,
@@ -579,19 +600,47 @@ if __name__ == "__main__":
         pin_memory=True
     )
     
+    # Определяем устройство
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    print(f"Используемое устройство: {device}")
+    if device == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"Память GPU: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+
+    # Создаем модель
+    print("\n" + "="*60)
+    print("Создание модели...")
+    model = OGYEI_Classifier(
+        num_classes = 100,
+        model_name = "rexnet_150",
+        pretrained = True,
+        dropout_rate = 0.3,
+        unfreeze_layers = 2
+    )
+
+    print(model)
+
+    # Считаем параметры
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Всего параметров: {total_params:,}")
+    print(f"Обучаемых параметров: {trainable_params:,} ({trainable_params/total_params:.1%})")
+
+    # Обучаем модель
+    print("\n" + "="*60)
+    print("Начало обучения...")
+
     # Запускаем полный пайплайн
-    model, history = create_model_and_train(
-        checkpoint_path = './models/meds_classifier.pt',
+    model, history = train_and_validate_model(
+        model=model,
+        checkpoint_path = 'meds_classifier.pt',
         train_loader=train_loader,
         val_loader=val_loader,
         test_loader=test_loader,
-        num_classes=len(train_dataset.classes),  # Автоматически определяем количество классов
-        model_name="efficientnet_b3",
-        pretrained=True,
-        freeze_backbone=True,  # Начинаем с замороженного backbone
         num_epochs=30,
         learning_rate=1e-3,
-        device="cuda" if torch.cuda.is_available() else "cpu"
+        device=device
     )
     
     # Пример предсказания на одном изображении
